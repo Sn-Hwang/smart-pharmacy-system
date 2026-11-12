@@ -3,6 +3,7 @@
 See README.md for Playwright and Leaflet test setup.
 """
 import os
+import base64
 import json
 import re
 import shutil
@@ -93,6 +94,10 @@ class PharmacySearchTests(unittest.TestCase):
         self.serve_real_catalog = False
         self.catalog_held = []
         self.geocode = [{"lat": "21.028", "lon": "105.834", "type": "house", "display_name": "Hà Nội"}]
+        self.ocr_text = "ĐƠN THUỐC\nHọ tên: Nguyễn Văn A\n1. Paracetamol 500mg\nUống khi sốt\n2. Vitamin C 500mg"
+        self.real_ocr = False
+        self.api_stock = None
+        self.stock_requests = []
         self.context.route("**/*", self.route)
         self.page.goto(self.base, wait_until="networkidle")
         expect(self.page.locator(".panel#normal .find-button")).to_be_enabled()
@@ -114,7 +119,34 @@ class PharmacySearchTests(unittest.TestCase):
 
     def route(self, route):
         url = route.request.url
-        if url.startswith(self.base + "/data/pharmacies/index.json") and self.serve_real_catalog:
+        if url == self.base + "/runtime-config.js" and self.api_stock is not None:
+            route.fulfill(body='window.SMART_PHARMACY_CONFIG = {apiBaseUrl: ""};', content_type="text/javascript")
+        elif url == self.base + "/api/search/pharmacies":
+            body = route.request.post_data_json
+            self.stock_requests.append(body)
+            # Deliberately paginate one row at a time to catch clients returning just the first page.
+            page = body["page"]
+            route.fulfill(json={"data": self.api_stock[page - 1:page], "pagination": {"total": len(self.api_stock)}})
+        elif url.startswith("https://cdn.jsdelivr.net/npm/"):
+            if self.real_ocr:
+                asset = Path(os.environ["PRESCRIPTION_OCR_ASSET_DIR"]) / url.rsplit("/", 1)[1]
+                mime = "text/javascript" if asset.name.endswith(".js") else "application/wasm" if asset.name.endswith(".wasm") else "application/octet-stream"
+                route.fulfill(body=asset.read_bytes(), content_type=mime, headers={"Access-Control-Allow-Origin": "*"})
+            elif url.endswith("/dist/tesseract.min.js"):
+                # Simulate OCR only in deterministic UI tests. The optional real-engine test uses original assets.
+                route.fulfill(content_type="text/javascript", body="""
+window.Tesseract = {createWorker: async () => ({
+  recognize: async () => {
+    if (window.failPrescriptionOcr) throw new Error('Unreadable image');
+    const result = {data: {text: %s}};
+    if (window.holdPrescriptionOcr) return new Promise(resolve => {window.finishPrescriptionOcr = () => resolve(result)});
+    return result;
+  },
+  terminate: async () => { window.prescriptionWorkerTerminated = true; }
+})};""" % json.dumps(self.ocr_text))
+            else:
+                route.fulfill(body=b"\0", headers={"Access-Control-Allow-Origin": "*"})
+        elif url.startswith(self.base + "/data/pharmacies/index.json") and self.serve_real_catalog:
             route.continue_()
         elif url.startswith(self.base + "/data/pharmacies/index.json") and self.catalog is None:
             # API regression tests must not depend on whether production snapshots were generated.
@@ -597,6 +629,164 @@ class PharmacySearchTests(unittest.TestCase):
         self.assertEqual(len(self.requests), 1)
         self.assertLess(elapsed, 2)
         print(f"\nPersistent-cache nearby search: {elapsed * 1000:.0f} ms; additional Overpass requests: 0", flush=True)
+
+    def upload_prescription(self):
+        self.page.locator('[data-tab="prescription"]').click()
+        self.page.locator("#prescriptionFile").set_input_files({
+            "name": "prescription.png", "mimeType": "image/png",
+            "buffer": base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="),
+        })
+
+    def seed_inventory(self):
+        self.page.evaluate("""() => {
+            const medicines = [{name:'Paracetamol 500mg', quantity:10}, {name:'Vitamin C 500mg', quantity:10}];
+            const store = (name, latitude, stock) => ({pharmacy:{name, address:'Hà Nội', latitude, longitude:105.834}, medicines:stock});
+            localStorage.setItem('smartPharmacyOwnerData', JSON.stringify({
+                full:store('Nhà thuốc đủ thuốc',21.029,medicines),
+                partial:store('Nhà thuốc thiếu thuốc',21.029,medicines.slice(0,1)),
+                zero:store('Nhà thuốc hết hàng',21.029,[medicines[0],{...medicines[1],quantity:0}]),
+                wrong:store('Nhà thuốc sai hàm lượng',21.029,[{name:'Paracetamol 250mg',quantity:10},medicines[1]]),
+                far:store('Nhà thuốc xa',21.065,medicines),
+            }));
+        }""")
+
+    def test_prescription_requires_review_and_matches_all_medicines_in_stock(self):
+        self.seed_inventory()
+        self.upload_prescription()
+        expect(self.page.locator("#prescriptionMedicines li")).to_have_text(["Paracetamol 500mg", "Vitamin C 500mg"])
+        expect(self.page.locator("#prescriptionButton")).to_be_disabled()
+        self.assertEqual(self.page.evaluate("window.locationRequests"), 0)
+        self.page.locator("#confirmPrescriptionMedicines").check()
+        self.page.locator("#prescriptionButton").click()
+        self.completed(1)
+        expect(self.page.locator("#pharmacyList h3")).to_have_text("Nhà thuốc đủ thuốc")
+        expect(self.page.locator(".stock-match")).to_contain_text("Paracetamol 500mg, Vitamin C 500mg")
+        self.assertEqual(self.requests, [])  # An OSM proximity query cannot verify medicine availability.
+        self.page.locator("#searchRadius").select_option("5000")
+        self.completed(2)
+        self.page.locator("#medicineInput").fill("Loratadine 10mg")
+        expect(self.page.locator("#confirmPrescriptionMedicines")).not_to_be_checked()
+        expect(self.page.locator("#prescriptionButton")).to_be_disabled()
+        expect(self.page.locator("#results")).to_be_hidden()
+
+    def test_unreadable_or_failed_ocr_never_enables_search_from_image_alone(self):
+        self.ocr_text = "ĐƠN THUỐC\nHọ tên: Nguyễn Văn A"
+        self.upload_prescription()
+        expect(self.page.locator("#prescriptionOcrStatus")).to_have_attribute("data-state", "error")
+        expect(self.page.locator("#prescriptionButton")).to_be_disabled()
+        expect(self.page.locator("#prescriptionMedicines li")).to_have_count(0)
+        self.page.evaluate("window.failPrescriptionOcr = true")
+        self.page.locator("#retryPrescriptionOcr").click()
+        expect(self.page.locator("#prescriptionOcrStatus")).to_contain_text("Không đọc được ảnh")
+        expect(self.page.locator("#prescriptionButton")).to_be_disabled()
+        # Manual entry still works after OCR failure; unknown inventory is not presented as matching stock.
+        self.page.locator("#medicineInput").fill("Paracetamol 500mg")
+        self.page.locator("#confirmPrescriptionMedicines").check()
+        self.page.locator("#prescriptionButton").click()
+        self.completed(0)
+        expect(self.page.locator("#status")).to_contain_text("chưa khai báo tồn kho")
+
+    def test_remove_image_during_ocr_discards_late_results_and_allows_same_file(self):
+        self.page.evaluate("""() => {
+            window.holdPrescriptionOcr = true;
+            const revoke = URL.revokeObjectURL.bind(URL);
+            URL.revokeObjectURL = url => { window.revokedPrescriptionImage = url; revoke(url); };
+        }""")
+        self.upload_prescription()
+        self.page.wait_for_function("typeof window.finishPrescriptionOcr === 'function'")
+        self.page.locator("#removePrescriptionImage").click()
+        self.page.evaluate("window.finishPrescriptionOcr()")
+        expect(self.page.locator("#preview")).to_be_hidden()
+        expect(self.page.locator("#prescriptionFile")).to_have_value("")
+        expect(self.page.locator("#medicineInput")).to_have_value("")
+        expect(self.page.locator("#prescriptionMedicines li")).to_have_count(0)
+        expect(self.page.locator("#prescriptionButton")).to_be_disabled()
+        self.assertTrue(self.page.evaluate("window.revokedPrescriptionImage.startsWith('blob:')"))
+        self.page.evaluate("window.holdPrescriptionOcr = false")
+        self.upload_prescription()
+        expect(self.page.locator("#prescriptionMedicines li")).to_have_count(2)
+        self.page.locator("#confirmPrescriptionMedicines").check()
+        self.page.locator("#removePrescriptionImage").click()
+        expect(self.page.locator("#confirmPrescriptionMedicines")).not_to_be_checked()
+        expect(self.page.locator("#prescriptionButton")).to_be_disabled()
+
+    def test_prescription_search_fetches_all_api_pages_and_checks_strength(self):
+        def store(name, strength):
+            return {"name": name, "address": "Hà Nội", "lat": 21.029, "lng": 105.834, "distance_m": 110,
+                    "items": [{"available": [{"name": "Paracetamol", "strength": strength, "quantity": 5},
+                                              {"name": "Vitamin C", "strength": "500mg", "quantity": 5}]}]}
+        self.api_stock = [store("Sai hàm lượng", "250mg"), store("Đủ thuốc từ API", "500mg")]
+        self.page.reload(wait_until="networkidle")
+        self.upload_prescription()
+        expect(self.page.locator("#prescriptionMedicines li")).to_have_count(2)
+        self.page.locator("#confirmPrescriptionMedicines").check()
+        self.page.locator("#prescriptionButton").click()
+        self.completed(1)
+        expect(self.page.locator("#pharmacyList h3")).to_have_text("Đủ thuốc từ API")
+        self.assertEqual([body["page"] for body in self.stock_requests], [1, 2])
+        self.assertEqual(self.stock_requests[0]["medicine_names"], ["Paracetamol", "Vitamin C"])
+        self.assertTrue(self.stock_requests[0]["require_all"])
+        self.assertEqual(self.stock_requests[0]["radius_km"], 3)
+
+    def name_search_payload(self):
+        self.payload = {"elements": [
+            {"type": "node", "id": i, "lat": 21.028 + i * 0.0005, "lon": 105.834,
+             "tags": {"amenity": "pharmacy", "name": "FPT Long Châu"}} for i in range(1, 8)
+        ] + [
+            {"type": "node", "id": 20, "lat": 21.065, "lon": 105.834,
+             "tags": {"amenity": "pharmacy", "name": "Nhà thuốc Long Châu xa"}},
+            {"type": "node", "id": 21, "lat": 21.029, "lon": 105.834,
+             "tags": {"amenity": "pharmacy", "name": "Nhà thuốc không cùng tên"}},
+        ]}
+
+    def test_name_search_returns_every_matching_branch_and_repeats_with_radius(self):
+        self.name_search_payload()
+        self.page.locator("#pharmacySearch").fill("long chau")
+        self.page.locator("#pharmacySearch").press("Enter")
+        self.completed(7)  # Full results are not subject to the five-item autocomplete limit.
+        expect(self.page.locator("#map .leaflet-marker-icon")).to_have_count(7)
+        expect(self.page.locator("#status")).to_contain_text("long chau")
+        self.page.locator("#searchRadius").select_option("5000")
+        self.completed(8)
+        expect(self.page.locator("#pharmacyList")).not_to_contain_text("không cùng tên")
+        self.assertEqual(self.page.evaluate("window.locationRequests"), 1)
+
+    def test_selecting_name_suggestion_searches_branches_in_selected_address(self):
+        self.name_search_payload()
+        self.page.locator("#addressInput").fill("Hà Nội")
+        self.page.locator("#addressSearchButton").click()
+        self.completed(8)
+        self.page.locator("#pharmacySearch").fill("Long Châu")
+        self.page.locator(".pharmacy-suggestion").first.click()
+        self.completed(7)
+        expect(self.page.locator("#pharmacyList h3").first).to_have_text("FPT Long Châu")
+        self.assertEqual(self.page.evaluate("window.locationRequests"), 0)
+        self.assertEqual(self.geocode_requests, 1)
+
+    def test_unknown_name_shows_empty_results_without_falling_back_to_nearby(self):
+        self.page.locator("#pharmacySearch").fill("Tên nhà thuốc không tồn tại")
+        self.page.locator("#pharmacySearchButton").click()
+        self.completed(0)
+        expect(self.page.locator('#pharmacyList [data-state="empty"]')).to_be_visible()
+        expect(self.page.locator("#status")).to_contain_text("Tên nhà thuốc không tồn tại")
+
+    @unittest.skipUnless(os.environ.get("PRESCRIPTION_OCR_ASSET_DIR"), "Set PRESCRIPTION_OCR_ASSET_DIR to verified CDN engine/language assets")
+    def test_real_ocr_reads_an_actual_image_before_review(self):
+        self.real_ocr = True
+        self.page.locator('[data-tab="prescription"]').click()
+        image = self.page.evaluate("""() => {
+            const canvas = document.createElement('canvas'); canvas.width=1200; canvas.height=500;
+            const ctx=canvas.getContext('2d');ctx.fillStyle='white';ctx.fillRect(0,0,1200,500);
+            ctx.fillStyle='black';ctx.font='36px Arial';
+            ['DON THUOC','1. Paracetamol 500mg','2. Loratadine 10mg','3. Vitamin C 500mg']
+                .forEach((line,i)=>ctx.fillText(line,45,70+i*90));
+            return canvas.toDataURL().split(',')[1];
+        }""")
+        self.page.locator("#prescriptionFile").set_input_files({
+            "name": "real-prescription.png", "mimeType": "image/png", "buffer": base64.b64decode(image)})
+        expect(self.page.locator("#prescriptionMedicines li")).to_have_text([
+            "Paracetamol 500mg", "Loratadine 10mg", "Vitamin C 500mg"], timeout=90000)
+        expect(self.page.locator("#prescriptionButton")).to_be_disabled()
 
 
 if __name__ == "__main__":
