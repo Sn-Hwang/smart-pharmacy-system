@@ -21,6 +21,7 @@ const confirmPrescriptionMedicines = document.querySelector("#confirmPrescriptio
 let prescriptionImageUrl = null;
 let prescriptionOcrController = null;
 let prescriptionRevision = 0;
+let prescriptionReviewItems = new Map();
 const suggestion = document.querySelector("#suggestion");
 const suggestionTitle = document.querySelector("#suggestionTitle");
 const suggestionText = document.querySelector("#suggestionText");
@@ -783,6 +784,12 @@ function updatePrescriptionControls() {
   prescriptionMedicines.replaceChildren(...medicines.map(item => {
     const li = document.createElement("li");
     li.textContent = medicineLabel(item);
+    const review = prescriptionReviewItems.get(medicineLabel(item));
+    if (review?.needsReview) {
+      li.classList.add("needs-review");
+      li.textContent += " — cần đối chiếu ảnh";
+      li.title = `Chữ đọc từ ảnh: ${review.rawText}`;
+    }
     return li;
   }));
   if (medicines.length > 30) setPrescriptionStatus("Chỉ tìm tối đa 30 loại thuốc mỗi lần. Vui lòng chia nhỏ danh sách.", "error");
@@ -793,8 +800,9 @@ function setPrescriptionStatus(message, state = "ready") {
   prescriptionOcrStatus.dataset.state = state;
 }
 
-function invalidatePrescriptionResults() {
+function invalidatePrescriptionResults(clearReview = true) {
   prescriptionRevision++;
+  if (clearReview) prescriptionReviewItems.clear();
   confirmPrescriptionMedicines.checked = false;
   if (lastPharmacySearch?.mode === "prescription") {
     lastPharmacySearch = { ...lastPharmacySearch, mode: "normal" };
@@ -838,8 +846,10 @@ async function recognizePrescription(file) {
     });
     if (prescriptionOcrController !== controller) return;
     medicineInput.value = medicines.map(medicineLabel).join("\n");
+    prescriptionReviewItems = new Map(medicines.map(item => [medicineLabel(item), item]));
+    const uncertain = medicines.filter(item => item.needsReview).length;
     setPrescriptionStatus(medicines.length
-      ? `Đã đọc được ${medicines.length} loại thuốc. Hãy sửa tên hoặc hàm lượng chưa đúng và xác nhận danh sách.`
+      ? `Đã nhận diện ${medicines.length} loại thuốc.${uncertain ? ` Có ${uncertain} dòng chưa chắc chắn, cần đối chiếu ảnh gốc.` : ""} Hãy kiểm tra tên, hàm lượng và xác nhận danh sách.`
       : "Chưa nhận diện được thuốc. Hãy chụp ảnh rõ hơn hoặc nhập tên thuốc bên dưới.", medicines.length ? "ready" : "error");
   } catch (error) {
     if (prescriptionOcrController !== controller) return;
@@ -879,7 +889,11 @@ addListener(retryPrescriptionOcr, "click", () => {
   if (fileInput.files[0]) void recognizePrescription(fileInput.files[0]);
 });
 addListener(medicineInput, "input", () => {
-  invalidatePrescriptionResults();
+  invalidatePrescriptionResults(false);
+  const labels = new Set(parseMedicineList(medicineInput.value).map(medicineLabel));
+  for (const label of prescriptionReviewItems.keys()) {
+    if (!labels.has(label)) prescriptionReviewItems.delete(label);
+  }
   setPrescriptionStatus("Hãy kiểm tra và xác nhận danh sách thuốc trước khi tìm.");
   updatePrescriptionControls();
 });
