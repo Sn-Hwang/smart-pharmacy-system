@@ -96,6 +96,7 @@ class PharmacySearchTests(unittest.TestCase):
         self.geocode = [{"lat": "21.028", "lon": "105.834", "type": "house", "display_name": "Hà Nội"}]
         self.ocr_text = "ĐƠN THUỐC\nHọ tên: Nguyễn Văn A\n1. Paracetamol 500mg\nUống khi sốt\n2. Vitamin C 500mg"
         self.real_ocr = False
+        self.ocr_confidence = 95
         self.api_stock = None
         self.stock_requests = []
         self.context.route("**/*", self.route)
@@ -138,12 +139,12 @@ class PharmacySearchTests(unittest.TestCase):
 window.Tesseract = {createWorker: async () => ({
   recognize: async () => {
     if (window.failPrescriptionOcr) throw new Error('Unreadable image');
-    const result = {data: {text: %s}};
+    const result = {data: {text: %s, confidence: %s}};
     if (window.holdPrescriptionOcr) return new Promise(resolve => {window.finishPrescriptionOcr = () => resolve(result)});
     return result;
   },
   terminate: async () => { window.prescriptionWorkerTerminated = true; }
-})};""" % json.dumps(self.ocr_text))
+})};""" % (json.dumps(self.ocr_text), self.ocr_confidence))
             else:
                 route.fulfill(body=b"\0", headers={"Access-Control-Allow-Origin": "*"})
         elif url.startswith(self.base + "/data/pharmacies/index.json") and self.serve_real_catalog:
@@ -632,9 +633,14 @@ window.Tesseract = {createWorker: async () => ({
 
     def upload_prescription(self):
         self.page.locator('[data-tab="prescription"]').click()
+        image = self.page.evaluate("""() => {
+            const canvas = document.createElement('canvas'); canvas.width = 200; canvas.height = 300;
+            const ctx = canvas.getContext('2d'); ctx.fillStyle = 'white'; ctx.fillRect(0,0,200,300);
+            return canvas.toDataURL().split(',')[1];
+        }""")
         self.page.locator("#prescriptionFile").set_input_files({
             "name": "prescription.png", "mimeType": "image/png",
-            "buffer": base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="),
+            "buffer": base64.b64decode(image),
         })
 
     def seed_inventory(self):
@@ -685,6 +691,17 @@ window.Tesseract = {createWorker: async () => ({
         self.page.locator("#prescriptionButton").click()
         self.completed(0)
         expect(self.page.locator("#status")).to_contain_text("chưa khai báo tồn kho")
+
+    def test_uncertain_ocr_rows_are_marked_for_review_and_cleaned_before_search(self):
+        self.ocr_confidence = 58
+        self.ocr_text = "1. Baciamin Plus (NT) 1 tỉ CFU (Saccharomyces boulardii)\n2. PROHEPATIS (NT) 200mg (Desmodium)"
+        self.upload_prescription()
+        expect(self.page.locator("#prescriptionMedicines .needs-review")).to_have_count(2)
+        expect(self.page.locator("#medicineInput")).to_have_value("Baciamin Plus 1tỉCFU\nPROHEPATIS 200mg")
+        expect(self.page.locator("#prescriptionOcrStatus")).to_contain_text("2 dòng chưa chắc chắn")
+        expect(self.page.locator("#prescriptionButton")).to_be_disabled()
+        self.page.locator("#medicineInput").fill("Baciamin Plus 1tỉCFU\nPROHEPATIS 100mg")
+        expect(self.page.locator("#prescriptionMedicines .needs-review")).to_have_count(1)
 
     def test_remove_image_during_ocr_discards_late_results_and_allows_same_file(self):
         self.page.evaluate("""() => {
@@ -787,6 +804,46 @@ window.Tesseract = {createWorker: async () => ({
         expect(self.page.locator("#prescriptionMedicines li")).to_have_text([
             "Paracetamol 500mg", "Loratadine 10mg", "Vitamin C 500mg"], timeout=90000)
         expect(self.page.locator("#prescriptionButton")).to_be_disabled()
+
+    @unittest.skipUnless(os.environ.get("PRESCRIPTION_OCR_ASSET_DIR"), "Set PRESCRIPTION_OCR_ASSET_DIR to verified CDN engine/language assets")
+    def test_real_ocr_recovers_tilted_low_contrast_rows_and_flags_ambiguous_name(self):
+        self.real_ocr = True
+        self.page.locator('[data-tab="prescription"]').click()
+        image = self.page.evaluate("""() => {
+            const canvas = document.createElement('canvas'); canvas.width=760; canvas.height=900;
+            const ctx=canvas.getContext('2d');
+            const shadow=ctx.createLinearGradient(0,0,760,0);shadow.addColorStop(0,'#a0a0a0');shadow.addColorStop(1,'#e0e0e0');
+            ctx.fillStyle=shadow;ctx.fillRect(0,0,760,900);
+            ctx.translate(25,0);ctx.rotate(1.5*Math.PI/180);ctx.fillStyle='#585858';ctx.font='bold 20px Times New Roman';
+            ctx.fillText('ĐƠN THUỐC',280,70);ctx.font='15px Times New Roman';
+            ctx.fillText('Họ tên: Bệnh nhân kiểm thử',30,110);ctx.fillText('Chẩn đoán: Kiểm thử nhận diện',30,140);
+            ['1. Baciamin Plus (NT) 1 tỉ CFU (Saccharomyces boulardii)',
+             '2. Esapbe (NT) 40mg (Esomeprazole)',
+             '3. Alipro (NT) (THỰC PHẨM CHỨC NĂNG)',
+             '4. PROHEPATIS (NT) 200mg (Desmodium)'].forEach((text,i)=>{
+                const y=220+i*90;ctx.font='bold 15px Times New Roman';ctx.fillText(text,30,y);
+                ctx.font='13px Times New Roman';ctx.fillText('Uống sáng 1 viên, tối 1 viên',45,y+25);
+                ctx.fillText('x 30 ngày = 60 Viên',540,y);
+             });
+            ctx.fillText('Ngày 12 tháng 11 năm 2026',420,660);ctx.fillText('Bác sĩ khám bệnh',450,700);
+            return canvas.toDataURL('image/jpeg',0.65).split(',')[1];
+        }""")
+        self.page.locator("#prescriptionFile").set_input_files({
+            "name": "tilted-prescription.jpg", "mimeType": "image/jpeg", "buffer": base64.b64decode(image)})
+        self.page.wait_for_function("document.querySelector('#prescriptionOcrStatus').dataset.state !== 'reading'", timeout=90000)
+        actual = self.page.locator("#medicineInput").input_value()
+        self.assertEqual(self.page.locator("#prescriptionMedicines li").count(), 4, actual)
+        first = actual.splitlines()[0]
+        self.assertRegex(first.lower(), r"^baciamin \w+ 1t[ỉiỷy]cfu$")
+        # Small serif print can still confuse l/i. A guessed name must not be presented as certain.
+        if "baciamin plus" not in first.lower():
+            expect(self.page.locator("#prescriptionMedicines li").first).to_have_class("needs-review")
+            expect(self.page.locator("#prescriptionOcrStatus")).to_contain_text("chưa chắc chắn")
+        self.assertIn("Esapbe 40mg", actual)
+        self.assertIn("Alipro", actual)
+        self.assertIn("PROHEPATIS 200mg", actual)
+        self.assertNotIn("(NT)", actual)
+        self.assertNotIn("Saccharomyces", actual)
 
 
 if __name__ == "__main__":
